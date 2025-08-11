@@ -6,13 +6,18 @@ import { Server } from 'socket.io';
 import { nanoid } from 'nanoid';
 
 const PORT = process.env.PORT || 4000;
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
+const ALLOWED = (
+  process.env.ALLOWED_ORIGINS ||
+  'http://localhost:5173,capacitor://localhost'
+)
+  .split(',')
+  .map(s => s.trim());;
 
 const app = express();
-app.use(cors({ origin: CLIENT_ORIGIN }));
+app.use(cors({ origin: ALLOWED }));
 
 const httpServer = createServer(app);
-const io = new Server(httpServer, { cors: { origin: CLIENT_ORIGIN } });
+const io = new Server(httpServer, { cors: { origin: ALLOWED } });
 
 const rooms = new Map();
 
