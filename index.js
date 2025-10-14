@@ -20,6 +20,38 @@ const io = new Server(httpServer, { cors: { origin: ALLOWED } });
 
 const rooms = new Map();
 
+// NEW: simple FIFO queues per mode
+const queues = {
+  CLASSIC: [],
+  REVEAL_DIGITS: [],
+  REVEAL_POSITIONS: [],
+};
+
+function enqueue(mode, socketId) {
+  const q = queues[mode] || (queues[mode] = []);
+  if (!q.includes(socketId)) q.push(socketId);
+}
+
+function dequeue(mode, socketId) {
+  const q = queues[mode] || [];
+  queues[mode] = q.filter((id) => id !== socketId);
+}
+
+function popOpponent(mode, exceptId) {
+  const q = queues[mode] || [];
+  for (let i = 0; i < q.length; i++) {
+    if (q[i] !== exceptId) {
+      const [opp] = q.splice(i, 1);
+      return opp;
+    }
+  }
+  return null;
+}
+
+function isInAnyQueue(id) {
+  return Object.values(queues).some((q) => q.includes(id));
+}
+
 function makeRoom(mode = "CLASSIC") {
   const code = nanoid(6).toUpperCase();
   const room = {
@@ -58,6 +90,13 @@ function feedbackMask(guess, secret) {
 
 io.on("connection", (socket) => {
   socket.on("create-room", ({ name, mode }, cb) => {
+    // If queued, remove from queue before manual room flow
+    const qMode = socket.data?.queueMode;
+    if (qMode) {
+      dequeue(qMode, socket.id);
+      socket.data.queueMode = undefined;
+    }
+
     const room = makeRoom((mode || "CLASSIC").toUpperCase());
     room.players[socket.id] = {
       name: name?.trim() || "Player A",
@@ -66,12 +105,19 @@ io.on("connection", (socket) => {
     };
     room.order.push(socket.id);
     socket.join(room.code);
-    socket.data.roomCode = room.code; // <-- track membership
+    socket.data.roomCode = room.code; // track membership
     cb?.({ code: room.code });
     io.to(room.code).emit("room-update", publicRoom(room));
   });
 
   socket.on("join-room", ({ code, name }, cb) => {
+    // If queued, remove from queue before manual join
+    const qMode = socket.data?.queueMode;
+    if (qMode) {
+      dequeue(qMode, socket.id);
+      socket.data.queueMode = undefined;
+    }
+
     const room = rooms.get((code || "").toUpperCase());
     if (!room) return cb?.({ error: "Room not found" });
     if (Object.keys(room.players).length >= 2)
@@ -84,7 +130,7 @@ io.on("connection", (socket) => {
     };
     room.order.push(socket.id);
     socket.join(room.code);
-    socket.data.roomCode = room.code; // <-- track membership
+    socket.data.roomCode = room.code; // track membership
     cb?.({ code: room.code });
     io.to(room.code).emit("room-update", publicRoom(room));
   });
@@ -140,6 +186,70 @@ io.on("connection", (socket) => {
 
     io.to(code).emit("history-update", room.history.map(slimHistory));
     io.to(code).emit("room-update", publicRoom(room));
+
+    // --- QUEUE: JOIN ---
+    socket.on("queue:join", ({ mode, name }, cb) => {
+      mode = (mode || "CLASSIC").toUpperCase();
+      if (!queues[mode]) return cb?.({ error: "Unknown mode" });
+
+      // Don't allow queueing if already in a room
+      if (socket.data.roomCode) return cb?.({ error: "Already in a room" });
+
+      // Avoid double-queueing
+      if (isInAnyQueue(socket.id)) return cb?.({ error: "Already queued" });
+
+      socket.data.playerName = name?.trim() || "Player";
+      socket.data.queueMode = mode;
+
+      enqueue(mode, socket.id);
+      cb?.({ ok: true });
+      io.to(socket.id).emit("queue:joined", { mode });
+
+      // Try to match
+      const opponentId = popOpponent(mode, socket.id);
+      if (opponentId) {
+        // Also remove self from queue
+        dequeue(mode, socket.id);
+
+        const oppSocket = io.sockets.sockets.get(opponentId);
+        if (!oppSocket) {
+          // Opponent vanished – re-enqueue self
+          enqueue(mode, socket.id);
+          return;
+        }
+
+        // Create room & add both
+        const room = makeRoom(mode);
+        const meName = socket.data.playerName || "Player A";
+        const oppName = oppSocket.data.playerName || "Player B";
+
+        room.players[socket.id] = { name: meName, secret: null, ready: false };
+        room.players[opponentId] = {
+          name: oppName,
+          secret: null,
+          ready: false,
+        };
+        room.order.push(socket.id, opponentId);
+
+        socket.join(room.code);
+        oppSocket.join(room.code);
+        socket.data.roomCode = room.code;
+        oppSocket.data.roomCode = room.code;
+
+        // Let them know they’re matched
+        io.to(socket.id).emit("queue:matched", { code: room.code, mode });
+        io.to(opponentId).emit("queue:matched", { code: room.code, mode });
+
+        io.to(room.code).emit("room-update", publicRoom(room));
+      }
+    });
+  });
+
+  socket.on("queue:leave", (_, cb) => {
+    const mode = socket.data?.queueMode;
+    if (mode) dequeue(mode, socket.id);
+    socket.data.queueMode = undefined;
+    cb?.({ ok: true });
   });
 
   socket.on("reset-room", ({ code }) => {
@@ -163,14 +273,6 @@ io.on("connection", (socket) => {
 
     io.to(code).emit("room-update", publicRoom(room));
     io.to(code).emit("room-reset", publicRoom(room));
-  });
-
-  socket.on("disconnect", () => {
-    for (const [code, room] of rooms) {
-      if (room.players[socket.id]) {
-        destroyRoom(code, "player-left");
-      }
-    }
   });
 
   function destroyRoom(code, reason = "player-left") {
@@ -198,6 +300,11 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnecting", () => {
+    // If queued, remove
+    const qMode = socket.data?.queueMode;
+    if (qMode) dequeue(qMode, socket.id);
+
+    // If in a room, destroy (keeps your current behavior)
     const code = socket.data?.roomCode;
     if (code && rooms.has(code)) {
       destroyRoom(code, "player-left");
@@ -205,11 +312,8 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    for (const [code, room] of rooms) {
-      if (room.players[socket.id]) {
-        destroyRoom(code, "player-left");
-      }
-    }
+    // Also sweep queues just in case
+    Object.keys(queues).forEach((m) => dequeue(m, socket.id));
   });
 });
 
