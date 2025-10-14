@@ -66,6 +66,7 @@ io.on("connection", (socket) => {
     };
     room.order.push(socket.id);
     socket.join(room.code);
+    socket.data.roomCode = room.code; // <-- track membership
     cb?.({ code: room.code });
     io.to(room.code).emit("room-update", publicRoom(room));
   });
@@ -75,6 +76,7 @@ io.on("connection", (socket) => {
     if (!room) return cb?.({ error: "Room not found" });
     if (Object.keys(room.players).length >= 2)
       return cb?.({ error: "Room is full" });
+
     room.players[socket.id] = {
       name: name?.trim() || "Player B",
       secret: null,
@@ -82,6 +84,7 @@ io.on("connection", (socket) => {
     };
     room.order.push(socket.id);
     socket.join(room.code);
+    socket.data.roomCode = room.code; // <-- track membership
     cb?.({ code: room.code });
     io.to(room.code).emit("room-update", publicRoom(room));
   });
@@ -142,6 +145,14 @@ io.on("connection", (socket) => {
   socket.on("reset-room", ({ code }) => {
     const room = rooms.get(code);
     if (!room) return;
+
+    // If one player left, destroy instead of resetting
+    if (Object.keys(room.players).length < 2) {
+      destroyRoom(code, "player-left");
+      return;
+    }
+
+    // Normal reset
     for (const id of Object.keys(room.players)) {
       room.players[id].secret = null;
       room.players[id].ready = false;
@@ -149,24 +160,46 @@ io.on("connection", (socket) => {
     room.history = [];
     room.winner = null;
     room.turnIndex = room.order.length === 2 ? (room.turnIndex + 1) % 2 : 0;
+
     io.to(code).emit("room-update", publicRoom(room));
     io.to(code).emit("room-reset", publicRoom(room));
+  });
+
+  socket.on("disconnect", () => {
+    for (const [code, room] of rooms) {
+      if (room.players[socket.id]) {
+        destroyRoom(code, "player-left");
+      }
+    }
   });
 
   function destroyRoom(code, reason = "player-left") {
     const room = rooms.get(code);
     if (!room) return;
+
     io.to(code).emit("room-destroyed", { reason });
     try {
+      // clear membership markers
+      for (const id of Object.keys(room.players)) {
+        const s = io.sockets.sockets.get(id);
+        if (s) s.data.roomCode = undefined;
+      }
       io.in(code).socketsLeave(code);
     } catch {}
+
     rooms.delete(code);
   }
 
   socket.on("leave-room", ({ code }) => {
     const room = rooms.get(code);
     if (!room) return;
-    if (room.players[socket.id]) {
+    if (!room.players[socket.id]) return;
+    destroyRoom(code, "player-left");
+  });
+
+  socket.on("disconnecting", () => {
+    const code = socket.data?.roomCode;
+    if (code && rooms.has(code)) {
       destroyRoom(code, "player-left");
     }
   });
